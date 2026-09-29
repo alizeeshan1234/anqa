@@ -275,7 +275,151 @@ async function main() {
         log("crank", `${m.id} ${m.cranks} ticks · mark $${(Number(os1.lastPrice) / 1e6).toLocaleString()}`);
       }
     })();
-  const crank = (m: Mkt) => riskJob(() => crankTx(m));
+  // How far this asset's accrual clock trails the group header.
+  //
+  // A crank accrues its asset by at most `max_accrual_dt_slots` (100) — but
+  // it also ticks the venue clock by up to 100, and so does every neighbour's
+  // crank and every sweep. On a host producing ~100 slots/s (MagicBlock
+  // devnet since 2026-09; it was ~15/s when this keeper was tuned) a tick is
+  // always the full 100, so a lone crank gains no ground and the asset stays
+  // loss-stale forever — and the kernel refuses every risk-increasing fill
+  // as LockActive. Cranks fired back-to-back land faster than the host makes
+  // 100 slots, so each one in a burst gains net ground. Offsets pinned by
+  // app/diag-assets.ts and programs/anqa-core/tests/diag.rs.
+  const HDR_CURRENT_SLOT = 8 + 581; // RiskGroup: disc + header.current_slot (slot_last is at 573)
+  const SLOT_STRIDE = 1293; // sizeof(PercMarket<AssetTag>)
+  const ASSET_SLOT_LAST = 8 + 41; // tag + AssetStateV16.slot_last
+  const assetLag = async (m: Mkt): Promise<number> => {
+    const [rg, as] = await Promise.all([
+      er.getAccountInfo(riskGroup),
+      er.getAccountInfo(assetSlots),
+    ]);
+    if (!rg || !as) return 0;
+    const header = Number(rg.data.readBigUInt64LE(HDR_CURRENT_SLOT));
+    const slotLast = Number(
+      as.data.readBigUInt64LE(8 + m.asset * SLOT_STRIDE + ASSET_SLOT_LAST)
+    );
+    return header - slotLast;
+  };
+  // A burst of cranks, pipelined: signed up front and sent without waiting
+  // for each confirmation. Sent one-at-a-time, each crank lands ~300ms apart
+  // — 30 host slots — so the venue clock ticks 30 and the asset accrues 100,
+  // a gain of 70 per crank while every *other* asset loses 30. Three live
+  // assets at that rate is a treadmill. Pipelined, cranks land a few slots
+  // apart, the clock ticks a few and the asset still accrues 100 per crank,
+  // so a burst closes thousands of slots in a second and costs its
+  // neighbours almost nothing. Each transaction carries a distinct priority
+  // fee so identical instructions on one blockhash still sign differently.
+  const crankBurst = async (m: Mkt, count: number) => {
+    const { blockhash } = await er.getLatestBlockhash();
+    const txs = await Promise.all(
+      Array.from({ length: count }, async (_, i) => {
+        const tx = await pEr.methods
+          .crank(m.asset, new BN(0))
+          .accounts({
+            cranker: keeper.publicKey,
+            market: m.market,
+            riskGroup,
+            assetSlots,
+            oracleState: m.oracleState,
+            internalOracle: m.internalOracle,
+            venueClock,
+          })
+          .preInstructions([ComputeBudgetProgram.setComputeUnitPrice({ microLamports: i + 1 })])
+          .transaction();
+        tx.feePayer = keeper.publicKey;
+        tx.recentBlockhash = blockhash;
+        tx.sign(keeper);
+        return tx.serialize();
+      })
+    );
+    // Sent in parallel chunks: a serial send is ~15ms each, which caps a
+    // burst at ~60 cranks/s; an 18-million-slot debt (seven idle weeks on a
+    // 100-slot/s host) is 180k cranks, and that has to finish in minutes,
+    // not hours. Dropped sends are fine — the next round measures what
+    // actually landed.
+    let sent = 0;
+    for (let i = 0; i < txs.length; i += 32) {
+      const results = await Promise.allSettled(
+        txs.slice(i, i + 32).map((raw) => er.sendRawTransaction(raw, { skipPreflight: true }))
+      );
+      sent += results.filter((r) => r.status === "fulfilled").length;
+    }
+    m.cranks += sent;
+    cranks += sent;
+    return sent;
+  };
+  /**
+   * Crank until the asset's accrual clock has caught the header, or `rounds`
+   * bursts. Each round sizes its burst to the measured lag.
+   */
+  /** Debt beyond this is weeks of idle host — the walk-off loop's job, not a pass's. */
+  const DEEP_DEBT = 50_000;
+  const crankUntilCurrent = async (m: Mkt, rounds: number, walkOff = false): Promise<number> => {
+    const start = await assetLag(m);
+    let lag = start;
+    let i = 0;
+    let sent = 0;
+    // One confirmed crank first, always: it is what pushes the fresh mark into
+    // the oracle state the terminal and the maker read, so it must land even
+    // when the accrual clock is already current. It also probes: a market
+    // whose oracle is stale refuses every crank (6020), and this one throws
+    // instead of a burst of silent refusals, so the caller's guard logs it
+    // once and moves on.
+    await crankTx(m);
+    sent++;
+    lag = await assetLag(m);
+    // A pass only pushes the mark on a deep-debt market; bursting here would
+    // hold every other market's mark and settlement behind it for minutes.
+    if (!walkOff && lag > DEEP_DEBT) return lag;
+    for (; i < rounds && lag > 0; i++) {
+      sent += await crankBurst(m, Math.min(Math.ceil(lag / 90) + 1, 256));
+      await sleep(700);
+      lag = await assetLag(m);
+    }
+    if (start > 2_000 || lag > 0) {
+      log("crank", `${m.id} lag ${start.toLocaleString()} → ${lag.toLocaleString()} slots after ${sent} crank(s) in ${i} burst(s)`);
+    }
+    return lag;
+  };
+  const crank = (m: Mkt) => riskJob(() => crankUntilCurrent(m, 8).then(() => undefined));
+
+  // walk-off: grind deep accrual debt down in bounded bursts, one market at a
+  // time, between the passes. Each job is a few seconds inside `riskJob`, so
+  // marks and settlements on the healthy markets keep their cadence.
+  const walkOff = async () => {
+    // A market whose crank refuses (stale oracle, 6020) would otherwise be
+    // picked again immediately, forever, and starve the ones that can move.
+    const retryAt = new Map<number, number>();
+    for (;;) {
+      let worst: Mkt | null = null;
+      let worstLag = DEEP_DEBT;
+      for (const m of MK) {
+        if ((retryAt.get(m.id) ?? 0) > Date.now()) continue;
+        const lag = await assetLag(m).catch(() => 0);
+        if (lag > worstLag) {
+          worst = m;
+          worstLag = lag;
+        }
+      }
+      if (!worst) {
+        await sleep(30_000);
+        continue;
+      }
+      const m = worst;
+      try {
+        await riskJob(() => crankUntilCurrent(m, 2, true));
+      } catch (e: any) {
+        const msg = String(e?.msg ?? e?.message ?? e).slice(0, 90);
+        if (msg !== lastErr) {
+          log("walkoff", `${m.id} · ${msg} — retrying in 60s`);
+          lastErr = msg;
+        }
+        retryAt.set(m.id, Date.now() + 60_000);
+      }
+      await sleep(250);
+    }
+  };
 
   // settle: drain whatever the book matched, oldest first.
   //
@@ -290,8 +434,10 @@ async function main() {
       if (n === 0) return;
       await riskJob(async () => {
         // This must be the last clock advance before the fill. A group holds
-        // multiple assets, and cranking any neighbour makes this asset stale.
-        await crankTx(m);
+        // multiple assets, and cranking any neighbour makes this asset stale —
+        // so crank until this asset's accrual clock has actually caught the
+        // header, not just once.
+        await crankUntilCurrent(m, 12);
 
         for (let i = 0; i < Math.min(n, 4); i++) {
           const cur: any = await pEr.account.book.fetch(m.book);
@@ -765,49 +911,30 @@ async function main() {
   await forEachMarket("sweep", sweep);
   await claimDeposits();
 
-  // A keeper outage leaves the kernel with an accrual-slot debt: each crank
-  // advances the accrual clock by at most `max_accrual_dt_slots` (100), so a
-  // gap of hours arms loss-staleness and every fill settles as refused
-  // (LockActive) until the clock catches up — at the normal cadence, ~35
-  // slots/s against a rollup ticking ~15/s. So on every start, measure the
-  // debt straight off the risk header and crank back-to-back until it clears.
-  // Offsets pinned by programs/anqa-core/tests/diag.rs.
-  const HDR = { slotLast: 8 + 573, lossStale: 8 + 591 };
-  const debt = async () => {
-    const [info, now] = await Promise.all([er.getAccountInfo(riskGroup), er.getSlot()]);
-    if (!info) return { behind: 0, lossStale: false };
-    return {
-      behind: now - Number(info.data.readBigUInt64LE(HDR.slotLast)),
-      lossStale: info.data[HDR.lossStale] === 1,
-    };
-  };
+  // A keeper outage leaves every asset with an accrual-slot debt — and so
+  // does a fast host (see `assetLag`). Measure each asset's own lag against
+  // the header and burst-crank it down before anything else runs. The old
+  // check compared the rollup's slot against the venue clock, two clocks in
+  // different frames, and so never fired.
   const catchUp = async () => {
-    let d = await debt();
-    if (!d.lossStale && d.behind < 400) return;
-    log("catchup", `accrual clock ${d.behind.toLocaleString()} slots behind — cranking hard`);
-    for (let i = 0; d.lossStale || d.behind > 200; i++) {
-      if (i >= 5000) return log("catchup", "gave up after 5000 cranks — still behind");
-      try {
-        await pEr.methods
-          .crank(MK[0].asset, new BN(0))
-          .accounts({
-            cranker: keeper.publicKey,
-            market: MK[0].market,
-            riskGroup,
-            assetSlots,
-            oracleState: MK[0].oracleState,
-            internalOracle: MK[0].internalOracle,
-            venueClock,
-          })
-          .rpc();
-      } catch (e: any) {
-        log("catchup", `· ${String(e?.message ?? e).slice(0, 90)}`);
-        await sleep(1000);
-      }
-      if (i % 50 === 0) d = await debt();
-      if (i % 200 === 0 && i > 0) log("catchup", `${d.behind.toLocaleString()} slots to go`);
+    for (const m of MK) {
+      await guard("catchup", async () => {
+        const lag = await assetLag(m);
+        if (lag <= 0) return;
+        // A debt this size is weeks of idle host. Do not hold every other
+        // loop hostage to it here; the crank pass walks it off in bursts
+        // while the healthy markets keep trading.
+        if (lag > 2_000_000) {
+          return log("catchup", `${m.id} accrual clock ${lag.toLocaleString()} slots behind — walking off in the crank pass`);
+        }
+        log("catchup", `${m.id} accrual clock ${lag.toLocaleString()} slots behind — cranking hard`);
+        const left = await crankUntilCurrent(m, 200);
+        log(
+          "catchup",
+          left > 0 ? `${m.id} still ${left.toLocaleString()} behind — gave up` : `${m.id} caught up`
+        );
+      });
     }
-    log("catchup", "caught up — loss-staleness cleared");
   };
   await catchUp();
 
@@ -973,6 +1100,7 @@ async function main() {
   every(2_000, "mirrors", publishOrderMirrors);
   every(4_000, "isolated", isolatedSweep);
   if (SWEEP_MS > 0) every(SWEEP_MS, "sweep", sweep);
+  void walkOff();
 
   // Hub-wide work: once, not once per market. This is the half that made a
   // process-per-market design cost N times more than it had any reason to.

@@ -218,3 +218,70 @@ fn dump_asset_prices() {
         );
     }
 }
+
+/// Replay `settle_fill`'s exact sequence — sweep every domain against the
+/// header clock, refresh taker then maker, then trade — and print each step.
+/// Same env as `replay_trade`.
+#[test]
+fn replay_settle() {
+    use anqa_core::state::{AssetSlots, Portfolio, RiskGroup};
+    use percolator::{MarketGroupV16ViewMut, PortfolioV16ViewMut, TradeRequestV16, POS_SCALE};
+
+    let Ok(sc) = std::env::var("SC") else {
+        eprintln!("SC not set — skipping");
+        return;
+    };
+    let f = |env: &str, def: &str| -> String {
+        std::env::var(env).unwrap_or_else(|_| format!("{sc}/{def}"))
+    };
+    let mut risk_bytes = std::fs::read(f("REPLAY_RISK", "risk.bin")).unwrap();
+    let mut slots_bytes = std::fs::read(f("REPLAY_SLOTS", "assets.bin")).unwrap();
+    let mut taker_bytes = std::fs::read(f("REPLAY_TAKER", "pf1.bin")).unwrap();
+    let mut maker_bytes = std::fs::read(f("REPLAY_MAKER", "pf0.bin")).unwrap();
+
+    let risk: &mut RiskGroup = bytemuck::from_bytes_mut(&mut risk_bytes);
+    let slots: &mut AssetSlots = bytemuck::from_bytes_mut(&mut slots_bytes);
+    let taker: &mut Portfolio = bytemuck::from_bytes_mut(&mut taker_bytes);
+    let maker: &mut Portfolio = bytemuck::from_bytes_mut(&mut maker_bytes);
+
+    let n = risk.asset_count();
+    let now_slot = risk.header().current_slot.get();
+    println!("header current_slot {now_slot}, {n} assets");
+    let mut view = MarketGroupV16ViewMut::new(risk.header_mut(), &mut slots.markets_mut()[..n]);
+    for domain in 0..n * 2 {
+        match view.expire_source_backing_bucket_not_atomic(domain, now_slot) {
+            Ok(()) => println!("sweep domain {domain}: expired"),
+            Err(e) => println!("sweep domain {domain}: {e:?}"),
+        }
+    }
+    {
+        let mut tv = PortfolioV16ViewMut::new(taker.account_mut());
+        match view.full_account_refresh_not_atomic(&mut tv) {
+            Ok(_) => println!("taker refresh OK"),
+            Err(e) => println!("taker refresh FAILED — {e:?}"),
+        }
+    }
+    {
+        let mut mv = PortfolioV16ViewMut::new(maker.account_mut());
+        match view.full_account_refresh_not_atomic(&mut mv) {
+            Ok(_) => println!("maker refresh OK"),
+            Err(e) => println!("maker refresh FAILED — {e:?}"),
+        }
+    }
+    let env_n = |k: &str, d: i128| -> i128 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let req = TradeRequestV16 {
+        asset_index: env_n("REPLAY_ASSET", 0) as usize,
+        size_q: env_n("REPLAY_LOTS", 10) * POS_SCALE as i128,
+        exec_price: env_n("REPLAY_PRICE", 63_055_000) as u64,
+        fee_bps: 0,
+    };
+    let mut tv = PortfolioV16ViewMut::new(taker.account_mut());
+    let mut mv = PortfolioV16ViewMut::new(maker.account_mut());
+    match view.execute_trade_with_fee_loss_stale_scoped_not_atomic(&mut tv, &mut mv, req) {
+        Ok(o) => println!("TRADE OK — notional {}", o.notional),
+        Err(e) => println!("TRADE FAILED — {e:?}"),
+    }
+    println!("LOCKACTIVE first line {} last line {}", percolator::LOCK_ACTIVE_FIRST.load(core::sync::atomic::Ordering::Relaxed), percolator::LOCK_ACTIVE_LAST.load(core::sync::atomic::Ordering::Relaxed));
+}

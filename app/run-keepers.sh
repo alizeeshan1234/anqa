@@ -45,7 +45,7 @@ MM_MARKETS=${ANQA_MM_MARKETS:-${ANQA_MARKETS:-930:0,931:1,932:2,933:3,934:4,935:
 
 # The long-tail feeds have no devnet sponsor — one pusher keeps every feed's
 # fixed shard-0 account fresh.
-ANQA_PUSH_LOOP_SECS=120 nohup npx ts-node --transpile-only app/push-feed.ts \
+ANQA_PUSH_LOOP_SECS=${ANQA_PUSH_LOOP_SECS:-15} nohup npx ts-node --transpile-only app/push-feed.ts \
   >"app/.push-feed.log" 2>&1 &
 echo "feed pusher pid $!"
 
